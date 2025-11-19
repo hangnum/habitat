@@ -1,484 +1,303 @@
 # -*- coding: utf-8 -*-
 """
-医学影像K-Means聚类与PyRadiomics特征提取流程。
+医学栖息地分析管道 (Medical Habitat Analysis Pipeline)
 
-该脚本实现了一个自动化流程，用于：
-1. 加载NIfTI, DICOM, NRRD等格式的医学影像。
-2. 使用K-Means算法基于像素/体素强度进行无监督分割。
-3. 对分割结果进行后处理，提取空间上连续的区域。
-4. 对每个连续区域，使用PyRadiomics库提取影像组学特征。
-5. 输出特征提取结果的摘要。
+本模块集成了K-Means聚类算法进行子区域分割和PyRadiomics进行纹理特征提取。
+专为2D ROI（感兴趣区域）图像块设计，用于医学影像分析。
 
-遵循Google Python项目规范。
+主要功能：
+1. 基于图像强度的K-Means聚类，将ROI分割为不同的栖息地（低、中、高强度区域）
+2. 使用PyRadiomics提取各种纹理特征（一阶统计、GLCM、GLRLM、GLSZM、GLDM）
+3. 批量处理图像并输出特征到CSV文件
+
 """
 
-import argparse
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
-import matplotlib
-matplotlib.use('Agg')  # 使用非交互式后端，便于在无GUI环境下运行
-import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import SimpleITK as sitk
-from pyradiomics.radiomics import featureextractor
 from sklearn.cluster import KMeans
+from pyradiomics.radiomics import featureextractor
 
-# 配置日志记录器
+# --- 日志配置 ---
+# 抑制冗余的库日志输出，保持应用程序日志清晰
+logging.getLogger('radiomics').setLevel(logging.ERROR)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 LOGGER = logging.getLogger(__name__)
 
-
 @dataclass
-class PipelineConfig:
+class ExtractionConfig:
     """
-    存储流程所需的所有配置参数。
-
-    属性:
-      image_path: 输入影像文件的路径。
-      image_format: 影像格式，'auto'表示自动检测。
-      n_clusters: K-Means算法的聚类数量。
-      random_state: K-Means算法的随机种子，用于保证结果可复现。
-      slice_axis: 对于3D影像，选择哪个轴进行切片可视化。
-      slice_index: 可视化切片的索引，None表示自动选择中间层。
-      plot_path: 聚类结果可视化图片的保存路径，None表示不保存。
-      max_voxels_per_cluster: 单个聚类允许的最大体素数，用于防止内存溢出。
-      num_workers: 特征提取时使用的并发工作线程数。
-    """
-    image_path: str
-    image_format: str = 'auto'
-    n_clusters: int = 3
-    random_state: int = 0
-    slice_axis: int = -1
-    slice_index: Optional[int] = None
-    plot_path: Optional[str] = 'clustering_result.png'
-    max_voxels_per_cluster: int = 1_000_000
-    num_workers: int = 1
-
-
-def load_medical_image(image_path: str,
-                       format_type: str = 'auto') -> Tuple[np.ndarray, sitk.Image]:
-    """
-    加载医学影像文件并返回其NumPy数组和SimpleITK图像对象。
-
-    该函数自动处理多通道图像，将其转换为单通道灰度图像。
-
-    参数:
-      image_path: 影像文件的路径。
-      format_type: 影像格式，'auto'将根据文件扩展名自动推断。
-
-    返回:
-      一个元组，包含：
-      - image_data (np.ndarray): 影像的NumPy数组表示。
-      - image_obj (sitk.Image): 影像的SimpleITK对象，保留了元数据。
-
-    异常:
-      ValueError: 如果指定的格式类型不受支持。
-      RuntimeError: 如果SimpleITK无法读取文件。
-    """
-    if not os.path.exists(image_path):
-        raise FileNotFoundError(f"影像文件不存在: {image_path}")
-
-    # SimpleITK 已能处理 NIfTI, NRRD, DICOM, MHA 等多种格式，无需特殊处理。
-    LOGGER.info("使用 SimpleITK 加载影像: %s", image_path)
-    image_obj = sitk.ReadImage(image_path)
-
-    # 检查并处理多通道（如彩色）影像
-    if image_obj.GetNumberOfComponentsPerPixel() > 1:
-        LOGGER.info("检测到多通道影像 (%s 通道)，将其转换为单通道灰度强度",
-                    image_obj.GetNumberOfComponentsPerPixel())
-        # VectorMagnitude 将多通道向量转换为标量大小，适用于彩色转灰度
-        image_obj = sitk.VectorMagnitude(image_obj)
-        # 确保转换后的图像类型为浮点型以便后续处理
-        image_obj = sitk.Cast(image_obj, sitk.sitkFloat32)
-
-    image_data = sitk.GetArrayFromImage(image_obj)
-    return image_data, image_obj
-
-
-def perform_kmeans_clustering(image_data: np.ndarray, n_clusters: int,
-                            random_state: int = 0) -> np.ndarray:
-    """
-    对影像数据执行K-Means聚类。
-
-    该聚类仅基于像素强度，不考虑空间信息。
-
-    参数:
-      image_data: 包含影像像素/体素强度的NumPy数组。
-      n_clusters: 要形成的聚类数量。
-      random_state: 随机数生成器的种子。
-
-    返回:
-      一个与image_data形状相同的NumPy数组，其中每个元素是其对应的聚类标签。
-    """
-    LOGGER.info("执行 K-Means 聚类 (clusters=%s, random_state=%s)", n_clusters,
-                random_state)
-    # 将多维数组展平为一维向量以进行聚类
-    image_flattened = image_data.flatten().reshape(-1, 1)
-
-    kmeans = KMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
-    labels = kmeans.fit_predict(image_flattened)
-
-    LOGGER.info("K-Means 聚类完成")
-    return labels.reshape(image_data.shape)
-
-
-def _postprocess_segmentation_mask(
-        raw_labels: np.ndarray) -> np.ndarray:
-    """
-    对原始分割掩码进行后处理，提取每个类别的最大连通组件。
-
-    此步骤至关重要，因为它确保了用于特征提取的每个区域在空间上是
-    连续的，从而使形态学特征（如面积、周长）具有意义。
-
-    参数:
-      raw_labels: K-Means生成的原始标签数组。
-
-    返回:
-      一个处理后的标签数组，其中每个标签对应一个单一、连续的区域。
-      标签ID将从1开始重新编号。
-    """
-    LOGGER.info("后处理分割掩码：提取每个聚类的最大连通组件。")
-    processed_labels = np.zeros_like(raw_labels, dtype=np.int32)
-    next_label_id = 1
+    特征提取管道配置类
     
-    unique_raw_labels = np.unique(raw_labels)
+    使用dataclass装饰器创建配置数据类，包含所有可配置的参数。
+    这样可以提高代码的可读性和可维护性。
+    """
+    n_clusters: int = 3  # K-Means聚类的簇数量，默认分为3个栖息地
+    # 纹理计算的Bin宽度。如果输入是CT(HU)图像，建议25；如果是MRI/归一化后图像(0-1)，需调整为0.05等
+    bin_width: float = 25.0 
+    min_roi_pixels: int = 10  # 最小有效像素阈值，用于过滤过小的ROI区域
 
-    for label in unique_raw_labels:
-        # 为当前聚类创建一个二值掩码
-        binary_mask = (raw_labels == label).astype(np.uint8)
-        
-        # 使用SimpleITK寻找所有连通的区域
-        mask_sitk = sitk.GetImageFromArray(binary_mask)
-        cc_filter = sitk.ConnectedComponentImageFilter()
-        labeled_mask_sitk = cc_filter.Execute(mask_sitk)
-        
-        num_components = cc_filter.GetObjectCount()
-        if num_components == 0:
-            continue
-        
-        # 仅保留最大的连通区域
-        relabel_filter = sitk.RelabelComponentImageFilter()
-        relabel_filter.SortByObjectSizeOn()
-        largest_component_sitk = relabel_filter.Execute(labeled_mask_sitk)
-        
-        # 将最大区域（现在标签为1）添加到最终的掩码中
-        largest_component_np = sitk.GetArrayFromImage(largest_component_sitk)
-        processed_labels[largest_component_np == 1] = next_label_id
-        next_label_id += 1
+class HabitatExtractor:
+    """
+    栖息地特征提取器主类
     
-    LOGGER.info("掩码后处理完成，生成了 %s 个连续区域。", next_label_id - 1)
-    return processed_labels
-
-
-def plot_cluster_slice(labels_reshaped: np.ndarray,
-                       output_path: Optional[str],
-                       axis: int = -1,
-                       slice_index: Optional[int] = None):
+    负责处理栖息地生成和特征提取的完整生命周期。
+    该类封装了图像加载、栖息地分割、特征提取等核心功能。
     """
-    将聚类结果的指定切片可视化并保存为图像文件。
 
-    如果输入是2D图像，则直接保存整个图像。
-
-    参数:
-      labels_reshaped: 聚类标签数组。
-      output_path: 图像文件的保存路径。如果为None，则不执行任何操作。
-      axis: 对于3D数据，选择切片的轴。
-      slice_index: 切片的索引。如果为None，则自动选择中间层。
-    """
-    if not output_path:
-        return
-
-    ndim = labels_reshaped.ndim
-    if ndim < 2:
-        LOGGER.warning("无法绘制维度小于2的图像。")
-        return
-
-    if ndim == 2:
-        slice_data = labels_reshaped
-        title = 'KMeans Clustering Result (2D)'
-        LOGGER.info("保存 2D 聚类结果 -> %s", output_path)
-    else:  # 3D or higher
-        # 规范化轴索引
-        if axis < 0:
-            axis += ndim
-        axis = max(0, min(axis, ndim - 1))
-
-        # 规范化切片索引
-        max_index = labels_reshaped.shape[axis] - 1
-        if slice_index is None or not (0 <= slice_index <= max_index):
-            slice_index = labels_reshaped.shape[axis] // 2
-
-        LOGGER.info("保存聚类图像切片 -> %s (axis=%s, slice=%s)", output_path, axis,
-                    slice_index)
+    def __init__(self, config: ExtractionConfig):
+        """
+        初始化栖息地提取器
         
-        # 使用slicing获取切片数据
-        slicer = [slice(None)] * ndim
-        slicer[axis] = slice_index
-        slice_data = labels_reshaped[tuple(slicer)]
-        title = f'KMeans Clustering Result (slice {slice_index} along axis {axis})'
+        Args:
+            config (ExtractionConfig): 特征提取配置对象
+        """
+        self.cfg = config
+        self.extractor = self._init_pyradiomics()
 
-    plt.figure(figsize=(8, 8))
-    plt.imshow(slice_data, cmap='viridis', interpolation='nearest')
-    plt.title(title)
-    plt.colorbar(label='Cluster ID')
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    LOGGER.info("聚类可视化结果已保存到 %s", output_path)
+    def _init_pyradiomics(self) -> featureextractor.RadiomicsFeatureExtractor:
+        """
+        初始化PyRadiomics特征提取器，配置2D图像处理设置
+        
+        Returns:
+            featureextractor.RadiomicsFeatureExtractor: 配置好的PyRadiomics提取器
+        """
+        # PyRadiomics参数配置
+        settings = {
+            'binWidth': self.cfg.bin_width,  # 直方图分箱宽度
+            'resampledPixelSpacing': None,  # 假设输入图像块已经具有一致的间距
+            'interpolator': 'sitkBSpline',  # 插值器类型
+            'force2D': True,  # 强制使用2D处理
+            'force2Ddimension': 0,  # 2D处理的维度（0表示第一个维度）
+            'label': 1,  # 默认标签值，将在后续动态覆盖
+            'normalize': False  # 假设在此步骤之前已经完成了显式预处理
+        }
+        
+        # 创建特征提取器并应用设置
+        extractor = featureextractor.RadiomicsFeatureExtractor(**settings)
+        extractor.disableAllFeatures()  # 禁用所有特征
+        
+        # 启用适合与ResNet连接的纹理特征
+        extractor.enableFeatureClassByName('firstorder')  # 一阶统计特征
+        extractor.enableFeatureClassByName('glcm')        # 灰度共生矩阵特征
+        extractor.enableFeatureClassByName('glrlm')       # 灰度游程长度矩阵特征
+        extractor.enableFeatureClassByName('glszm')       # 灰度大小区域矩阵特征
+        extractor.enableFeatureClassByName('gldm')        # 灰度依赖矩阵特征
+        
+        return extractor
 
+    def _load_image(self, image_path: str) -> sitk.Image:
+        """
+        加载图像并确保为单通道float32格式
+        
+        Args:
+            image_path (str): 图像文件路径
+            
+        Returns:
+            sitk.Image: 加载并转换后的SimpleITK图像对象
+            
+        Raises:
+            FileNotFoundError: 当图像文件不存在时抛出
+        """
+        # 检查文件是否存在
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"路径不存在: {image_path}")
+            
+        # 使用SimpleITK读取图像
+        img = sitk.ReadImage(image_path)
+        
+        # 处理RGB/RGBA图像 -> 转换为灰度图
+        if img.GetNumberOfComponentsPerPixel() > 1:
+            img = sitk.VectorMagnitude(img)  # 计算向量幅度（RGB到灰度）
+            
+        # 转换为float32类型以确保数值精度
+        return sitk.Cast(img, sitk.sitkFloat32)
 
-def configure_feature_extractor(
-    image_is_2d: bool) -> featureextractor.RadiomicsFeatureExtractor:
-    """
-    根据影像维度，配置并返回一个PyRadiomics特征提取器。
+    def _generate_habitat_mask(self, image: sitk.Image) -> Optional[sitk.Image]:
+        """
+        基于图像强度将ROI聚类分割为不同的栖息地
+        
+        使用K-Means聚类算法根据像素强度值将ROI区域分割为多个子区域（栖息地）。
+        聚类结果按强度中心排序，确保标签的一致性（1=低强度，2=中强度，3=高强度）。
+        
+        Args:
+            image (sitk.Image): 输入的2D图像对象
+            
+        Returns:
+            Optional[sitk.Image]: 多标签掩码图像，标签含义：
+                                 1: 低强度栖息地, 2: 中强度栖息地, 3: 高强度栖息地
+                                 返回None表示聚类失败或ROI过小
+        """
+        # 将SimpleITK图像转换为numpy数组以便使用sklearn
+        arr = sitk.GetArrayFromImage(image)
+        
+        # 定义ROI区域：假设0为背景（黑色）
+        # 注意：确保你的图像块已经预处理（背景=0）
+        roi_mask = arr > 1e-5  # 使用小阈值避免浮点精度问题
+        valid_pixels = arr[roi_mask].reshape(-1, 1)  # 提取ROI内的有效像素
 
-    参数:
-      image_is_2d: 一个布尔值，指示输入影像是否为2D。
-
-    返回:
-      一个配置好的 RadiomicsFeatureExtractor 实例。
-    """
-    LOGGER.info("初始化 PyRadiomics 特征提取器 (2D模式: %s)", image_is_2d)
-    settings = {
-        'binWidth': 25,
-        'interpolator': 'sitkBSpline',
-        'resampledPixelSpacing': None,
-    }
-    extractor = featureextractor.RadiomicsFeatureExtractor(**settings)
-    extractor.disableAllFeatures()
-
-    # 启用在2D和3D下均有意义的特征类别
-    extractor.enableFeatureClassByName('firstorder')
-    extractor.enableFeatureClassByName('glcm')  # 灰度共生矩阵 (纹理特征)
-
-    # 根据维度选择合适的形态学特征
-    if image_is_2d:
-        LOGGER.info("启用 2D 形态学特征 (shape2D)")
-        extractor.enableFeatureClassByName('shape2D')
-    else:
-        LOGGER.info("启用 3D 形态学特征 (shape)")
-        extractor.enableFeatureClassByName('shape')
-
-    LOGGER.info("特征提取器配置完成")
-    return extractor
-
-
-def extract_cluster_features(
-    image_obj: sitk.Image,
-    labels_reshaped: np.ndarray,
-    extractor: featureextractor.RadiomicsFeatureExtractor,
-    max_voxels_per_cluster: int,
-    num_workers: int,
-) -> Dict[int, Dict[str, Any]]:
-    """
-    对每个聚类区域并发执行PyRadiomics特征提取。
-
-    参数:
-      image_obj: 原始影像的SimpleITK对象。
-      labels_reshaped: 经过后处理的、包含连续区域标签的NumPy数组。
-      extractor: 配置好的PyRadiomics特征提取器实例。
-      max_voxels_per_cluster: 单个区域允许的最大体素数。
-      num_workers: 用于并发执行的线程数。
-
-    返回:
-      一个字典，键是聚类/区域的标签ID，值是包含该区域特征的字典。
-    """
-    cluster_features: Dict[int, Dict[str, Any]] = {}
-    unique_labels = np.unique(labels_reshaped)
-    # 排除背景标签0
-    cluster_ids = sorted([label for label in unique_labels if label != 0])
-    
-    if not cluster_ids:
-        LOGGER.warning("在掩码中未找到有效的非背景区域进行特征提取。")
-        return {}
-
-    def process_cluster(cluster_id: int):
-        """为单个聚类提取特征的内部函数。"""
-        cluster_mask_array = (labels_reshaped == cluster_id)
-        voxel_count = int(np.sum(cluster_mask_array))
-
-        if voxel_count > max_voxels_per_cluster:
-            LOGGER.warning("  区域 %s 过大 (%s 体素)，跳过以避免内存问题。",
-                           cluster_id, voxel_count)
+        # 检查ROI大小是否足够进行聚类
+        min_required_pixels = max(self.cfg.min_roi_pixels, self.cfg.n_clusters * 2)
+        if valid_pixels.shape[0] < min_required_pixels:
+            LOGGER.warning(f"ROI过小，无法进行聚类。有效像素数: {valid_pixels.shape[0]}, 最小要求: {min_required_pixels}")
             return None
-        
-        # 将NumPy掩码转换为带有正确元数据的SimpleITK图像
-        cluster_mask_sitk = sitk.GetImageFromArray(cluster_mask_array.astype(np.uint8))
-        cluster_mask_sitk.CopyInformation(image_obj)
 
         try:
-            # PyRadiomics要求标签必须为整数类型
-            feature_result = extractor.execute(image_obj, cluster_mask_sitk, label=1)
-            # 移除PyRadiomics添加的诊断信息，只保留特征值
-            cleaned_features = {
-                k: v for k, v in feature_result.items() if not k.startswith('diagnostics')
-            }
-            return cluster_id, cleaned_features
-        except Exception as exc:
-            LOGGER.error("  区域 %s 特征提取失败: %s", cluster_id, exc, exc_info=True)
+            # 执行K-Means聚类
+            kmeans = KMeans(
+                n_clusters=self.cfg.n_clusters, 
+                random_state=42,  # 固定随机种子确保结果可重现
+                n_init=10         # 使用不同的质心初始化运行10次，选择最佳结果
+            )
+            labels = kmeans.fit_predict(valid_pixels)
+
+            # 按强度中心排序聚类结果以确保一致性
+            # 0->低强度, 1->中强度, 2->高强度
+            centroids = kmeans.cluster_centers_.flatten()
+            sorted_indices = np.argsort(centroids)  # 按强度值排序
+            
+            # 创建标签映射：旧标签 -> 新标签（从1开始）
+            # 例如：如果聚类2的强度最小，则映射 2 -> 1
+            label_map = {old: new + 1 for new, old in enumerate(sorted_indices)}
+            
+            # 将标签映射回ROI形状
+            mapped_labels = np.vectorize(label_map.get)(labels)
+            
+            # 创建栖息地数组并填充标签
+            habitat_arr = np.zeros_like(arr, dtype=np.uint8)
+            habitat_arr[roi_mask] = mapped_labels
+            
+            # 转换回SimpleITK图像，关键是要保留空间元数据
+            habitat_img = sitk.GetImageFromArray(habitat_arr)
+            habitat_img.CopyInformation(image)  # 复制原始图像的空间信息
+            
+            return habitat_img
+
+        except Exception as e:
+            LOGGER.error(f"聚类失败: {e}")
             return None
 
-    LOGGER.info("开始对 %d 个区域进行特征提取...", len(cluster_ids))
-    if num_workers > 1:
-        LOGGER.info("启用多线程特征提取 (workers=%s)", num_workers)
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            future_to_id = {
-                executor.submit(process_cluster, cluster_id): cluster_id
-                for cluster_id in cluster_ids
-            }
-            for i, future in enumerate(as_completed(future_to_id)):
-                cluster_id = future_to_id[future]
-                LOGGER.info("  处理进度 %d/%d (区域ID: %s)", i + 1, len(cluster_ids), cluster_id)
-                result = future.result()
-                if result:
-                    cluster_features[result[0]] = result[1]
-    else:  # 单线程执行
-        for i, cluster_id in enumerate(cluster_ids):
-            LOGGER.info("  处理进度 %d/%d (区域ID: %s)", i + 1, len(cluster_ids), cluster_id)
-            result = process_cluster(cluster_id)
-            if result:
-                cluster_features[result[0]] = result[1]
+    def process_single_patch(self, image_path: str) -> Optional[Dict[str, float]]:
+        """
+        处理单个图像块的主要执行单元
+        
+        该方法是整个管道的核心执行函数，依次执行：
+        1. 图像加载和预处理
+        2. 栖息地掩码生成
+        3. 对每个栖息地提取特征
+        
+        Args:
+            image_path (str): 图像文件路径
+            
+        Returns:
+            Optional[Dict[str, float]]: 特征字典，包含图像名称和所有栖息地的特征
+                                      返回None表示处理失败
+        """
+        try:
+            # 加载和预处理图像
+            img_obj = self._load_image(image_path)
+            
+            # 生成栖息地掩码
+            mask_obj = self._generate_habitat_mask(img_obj)
+            
+            if mask_obj is None:
+                LOGGER.warning(f"无法为图像 {image_path} 生成栖息地掩码")
+                return None
 
-    LOGGER.info("特征提取完成，成功处理 %s 个区域。", len(cluster_features))
-    return cluster_features
+            # 初始化特征字典，包含图像名称
+            features = {'Image_Name': os.path.basename(image_path)}
+            # 栖息地标签映射
+            habitat_map = {1: 'Low', 2: 'Mid', 3: 'High'}
 
+            # 遍历所有栖息地标签，重用同一个掩码对象
+            for label_id, label_name in habitat_map.items():
+                try:
+                    # 检查掩码中是否存在该标签，避免PyRadiomics错误
+                    stats = sitk.LabelStatisticsImageFilter()
+                    stats.Execute(img_obj, mask_obj)
+                    if not stats.HasLabel(label_id):
+                        LOGGER.debug(f"掩码中不存在标签 {label_id}，跳过")
+                        continue
 
-def summarize_features(cluster_features: Dict[int, Dict[str, Any]],
-                       max_items_to_print: int = 5) -> None:
-    """
-    打印每个聚类提取出的特征摘要。
+                    # 使用动态标签参数执行特征提取
+                    # 高效：此处不创建新的SITK对象
+                    result = self.extractor.execute(img_obj, mask_obj, label=label_id)
+                    
+                    # 提取特征并重命名列
+                    for key, val in result.items():
+                        if 'diagnostics' not in key:  # 跳过诊断信息
+                            col_name = f"Hab_{label_name}_{key}"  # 格式：Hab_特征类型_特征名
+                            features[col_name] = float(val)
+                            
+                except Exception as inner_e:
+                    LOGGER.warning(f"标签 {label_name} ({label_id}) 的特征提取失败: {inner_e}")
+                    continue
 
-    参数:
-      cluster_features: 包含所有区域特征的字典。
-      max_items_to_print: 每个区域最多打印的特征数量。
-    """
-    LOGGER.info("--- 特征提取结果摘要 ---")
-    for cluster_id, features in sorted(cluster_features.items()):
-        LOGGER.info("区域 %s (共 %d 个特征):", cluster_id, len(features))
-        for i, (name, value) in enumerate(features.items()):
-            if i >= max_items_to_print:
-                LOGGER.info("  ... 等 %d 个更多特征", len(features) - i)
-                break
-            # 对浮点数值进行格式化以提高可读性
-            if isinstance(value, (float, np.floating)):
-                LOGGER.info("  - %s: %.4f", name, value)
-            else:
-                LOGGER.info("  - %s: %s", name, value)
-    LOGGER.info("--- 摘要结束 ---")
+            return features
 
-
-def run_pipeline(config: PipelineConfig) -> Dict[int, Dict[str, Any]]:
-    """
-    执行完整的影像分析流程。
-
-    参数:
-      config: 包含所有流程配置的PipelineConfig对象。
-
-    返回:
-      一个字典，包含每个成功处理的区域的影像组学特征。
-    """
-    # 1. 加载影像
-    image_data, image_obj = load_medical_image(config.image_path,
-                                               config.image_format)
-
-    # 2. 执行K-Means聚类
-    raw_labels = perform_kmeans_clustering(image_data, config.n_clusters,
-                                           config.random_state)
-    
-    # 3. 后处理分割掩码以获得空间连续的区域
-    processed_labels = _postprocess_segmentation_mask(raw_labels)
-
-    # 4. 可视化聚类结果
-    plot_cluster_slice(processed_labels, config.plot_path, config.slice_axis,
-                       config.slice_index)
-
-    # 5. 根据影像维度配置特征提取器
-    is_2d = image_obj.GetDimension() == 2
-    extractor = configure_feature_extractor(image_is_2d=is_2d)
-
-    # 6. 提取特征
-    cluster_features = extract_cluster_features(
-        image_obj=image_obj,
-        labels_reshaped=processed_labels,
-        extractor=extractor,
-        max_voxels_per_cluster=config.max_voxels_per_cluster,
-        num_workers=config.num_workers,
-    )
-
-    # 7. 打印结果摘要
-    if cluster_features:
-        summarize_features(cluster_features)
-    else:
-        LOGGER.warning("流程执行完毕，但没有提取到任何特征。")
-
-    return cluster_features
-
-
-def parse_args() -> PipelineConfig:
-    """解析命令行参数并返回一个PipelineConfig实例。"""
-    parser = argparse.ArgumentParser(
-        description="基于K-Means和PyRadiomics的医学影像特征提取流程。",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument(
-        '--image-path', default='./pyradiomics/data/37.png',
-        help='待处理的医学影像路径。')
-    parser.add_argument(
-        '--image-format', default='auto',
-        help='影像格式 (例如: sitk, auto)。')
-    parser.add_argument(
-        '--clusters', type=int, default=2,
-        help='K-Means聚类的数量。')
-    parser.add_argument(
-        '--random-state', type=int, default=42,
-        help='K-Means的随机种子，用于复现性。')
-    parser.add_argument(
-        '--slice-axis', type=int, default=-1,
-        help='3D影像可视化切片的轴 (0, 1, 2)。-1代表最后一个轴。')
-    parser.add_argument(
-        '--slice-index', type=int, default=None,
-        help='可视化切片的索引。默认为中间层。')
-    parser.add_argument(
-        '--plot-path', default='clustering_result.png',
-        help='聚类切片的可视化保存路径。输入 "none" 可禁用保存。')
-    parser.add_argument(
-        '--max-voxels', type=int, default=5_000_000,
-        help='为防止内存耗尽，单个聚类区域允许处理的最大体素数量。')
-    parser.add_argument(
-        '--workers', type=int, default=os.cpu_count() or 1,
-        help='特征提取时使用的并发线程数。')
-    args = parser.parse_args()
-
-    # 特殊处理 "none" 字符串以禁用绘图
-    plot_path = None if args.plot_path.lower() == 'none' else args.plot_path
-
-    return PipelineConfig(
-        image_path=args.image_path,
-        image_format=args.image_format,
-        n_clusters=args.clusters,
-        random_state=args.random_state,
-        slice_axis=args.slice_axis,
-        slice_index=args.slice_index,
-        plot_path=plot_path,
-        max_voxels_per_cluster=args.max_voxels,
-        num_workers=max(1, args.workers),
-    )
-
+        except Exception as e:
+            LOGGER.error(f"处理图像 {image_path} 时发生错误: {e}")
+            return None
 
 def main():
-    """程序主入口。"""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - [%(levelname)s] - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S')
+    """
+    主函数：执行完整的栖息地特征提取管道
     
-    try:
-        config = parse_args()
-        run_pipeline(config)
-    except Exception as e:
-        LOGGER.critical("流程执行过程中发生未捕获的异常: %s", e, exc_info=True)
+    处理流程：
+    1. 配置参数初始化
+    2. 创建栖息地提取器实例
+    3. 扫描输入目录中的图像文件
+    4. 批量处理图像并提取特征
+    5. 保存结果到CSV文件
+    """
+    # 配置参数：请根据你的数据调整binWidth！
+    # 如果是PNG图像（0-255），bin_width=25是合适的
+    # 如果是标准化的浮点图像（-3.0到3.0），bin_width必须更小（例如0.1）
+    config = ExtractionConfig(n_clusters=3, bin_width=25)
+    pipeline = HabitatExtractor(config)
 
+    # 数据目录路径，根据实际情况修改
+    data_dir = './data/patches'
+    
+    # 获取图像文件列表
+    if os.path.exists(data_dir):
+        image_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.png')]
+    else:
+        LOGGER.warning(f"数据目录不存在: {data_dir}")
+        image_files = []
+    
+    results = []  # 存储所有图像的特征结果
+    
+    LOGGER.info(f"开始处理 {len(image_files)} 张图像...")
+    
+    # 批量处理图像
+    for idx, fpath in enumerate(image_files):
+        # 每处理100张图像输出一次进度
+        if idx % 100 == 0 and idx > 0:
+            LOGGER.info(f"已处理 {idx}/{len(image_files)} 张图像")
+            
+        # 处理单张图像
+        feats = pipeline.process_single_patch(fpath)
+        if feats:
+            results.append(feats)
+
+    # 保存结果
+    if results:
+        # 创建DataFrame并填充缺失值
+        df = pd.DataFrame(results)
+        df.fillna(0, inplace=True)  # 将缺失值填充为0
+        
+        # 输出到CSV文件
+        output_path = 'habitat_features.csv'
+        df.to_csv(output_path, index=False)
+        LOGGER.info(f"处理完成。数据形状: {df.shape}。结果已保存到 {output_path}")
+    else:
+        LOGGER.warning("没有提取到任何特征。")
 
 if __name__ == '__main__':
     main()
