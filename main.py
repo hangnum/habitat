@@ -21,7 +21,15 @@ from sklearn.cluster import KMeans
 from pyradiomics.radiomics import featureextractor
 
 # --- 日志配置 ---
-logging.getLogger('radiomics').setLevel(logging.ERROR)
+for _name in ("radiomics", "radiomics.featureextractor"):
+    # PyRadiomics 在导入时会挂载自己的 handler，并默认 INFO 输出；这里直接静音，避免每张图都刷日志
+    _rlog = logging.getLogger(_name)
+    _rlog.handlers.clear()
+    _rlog.setLevel(logging.CRITICAL)
+    _rlog.propagate = False
+# 双保险：直接禁用模块内部的 logger（避免后来被重置时再次刷屏）
+featureextractor.logger.disabled = True
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 LOGGER = logging.getLogger(__name__)
 
@@ -137,7 +145,7 @@ class HabitatExtractor:
             if mask_obj is None:
                 return None
 
-            features = {'Image_Name': os.path.basename(image_path)}
+            features: Dict[str, Any] = {'Image_Name': os.path.basename(image_path)}
             habitat_map = {1: 'Low', 2: 'Mid', 3: 'High'}
 
             # --- 【性能修正】统计只需做一次 ---
@@ -169,43 +177,116 @@ class HabitatExtractor:
             LOGGER.error(f"处理失败 {image_path}: {e}")
             return None
 
+from collections import defaultdict
+from tqdm import tqdm # Import tqdm for progress bar
+
+def structure_data_by_hospital(image_files: List[Path], data_dir: Path) -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
+    """
+    按医院和模态组织数据，建立一个病人映射。
+    
+    返回结构: 
+    {
+        hospital_name: {
+            modality_name: {
+                patient_id: {
+                    'label': int, 
+                    'image_paths': List[Path]
+                }
+            }
+        }
+    }
+    """
+    hospital_data: Dict[str, Dict[str, Dict[str, Dict[str, Any]]]] = {}
+
+    for path in image_files:
+        try:
+            relative_parts = path.relative_to(data_dir).parts
+            
+            hospital = relative_parts[0]
+            modality = path.parent.name
+            patient_id = path.parent.parent.name
+            label_str = path.parent.parent.parent.name
+            label = int(label_str.replace('grade', ''))
+
+            # 使用 setdefault 优雅地构建嵌套字典
+            modality_dict = hospital_data.setdefault(hospital, {})
+            patient_dict = modality_dict.setdefault(modality, {})
+            patient_info = patient_dict.setdefault(patient_id, {'label': label, 'image_paths': []})
+            
+            # 追加图片路径
+            patient_info['image_paths'].append(path)
+
+        except (IndexError, ValueError) as e:
+            LOGGER.warning(f"解析路径失败 {path}，跳过。请检查路径结构。错误: {e}")
+            continue
+            
+    return hospital_data
+
+
 def main():
-    # 你的数据如果是 0-255 的 PNG，binWidth=25 是完美的
     config = ExtractionConfig(n_clusters=3, bin_width=25)
     pipeline = HabitatExtractor(config)
 
     data_dir = Path('/home/wwt/data/raw/liver/Grade')
+    output_dir = Path('/home/wwt/data/outputs/habitat/')
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if os.path.exists(data_dir):
-        image_files: List[Path] = []
-        for image_path in data_dir.rglob('*.png'):
-            image_files.append(Path(image_path))
-    else:
-        LOGGER.warning(f"目录不存在: {data_dir}")
-        return # 直接返回，不要继续
-    if not image_files:
-        LOGGER.warning("未找到 PNG 图像。")
+    if not data_dir.exists():
+        LOGGER.error(f"数据目录不存在: {data_dir}")
         return
-    
-    results = []
-    LOGGER.info(f"开始处理 {len(image_files)} 张图像...")
-    
-    for idx, fpath in enumerate(image_files):
-        if idx % 100 == 0 and idx > 0:
-            LOGGER.info(f"进度: {idx}/{len(image_files)}")
+
+    image_files = list(data_dir.rglob('*.png'))
+    if not image_files:
+        LOGGER.warning(f"在 {data_dir} 中未找到 PNG 图像。")
+        return
+
+    LOGGER.info(f"找到了 {len(image_files)} 张图像，开始构建医院-模态-病人映射...")
+    hospital_data = structure_data_by_hospital(image_files, data_dir)
+    LOGGER.info("数据结构构建完成。")
+
+    total_groups = sum(len(modalities) for modalities in hospital_data.values())
+    processed_groups = 0
+
+    LOGGER.info("开始按 医院 -> 模态 的顺序处理图像...")
+    for hospital, modality_data in hospital_data.items():
+        for modality, patients in modality_data.items():
+            processed_groups += 1
+            LOGGER.info(f"--- [进度 {processed_groups}/{total_groups}] ---")
+            LOGGER.info(f"正在处理 医院: [{hospital}], 模态: [{modality}]")
             
-        feats = pipeline.process_single_patch(fpath)
-        if feats:
-            results.append(feats)
+            modality_results: List[Dict[str, Any]] = []
+            
+            # 使用 tqdm 包裹病人循环，显示进度条
+            for patient_id, patient_info in tqdm(
+                patients.items(),
+                desc=f"  [{hospital}-{modality}] 处理病人", # 进度条描述
+                unit="病人",                               # 进度单位
+                leave=False                                # 完成后不保留进度条
+            ):
+                for fpath in patient_info['image_paths']:
+                    feats = pipeline.process_single_patch(fpath)
+                    if feats:
+                        # 补充元数据
+                        feats['Patient_ID'] = patient_id
+                        feats['Patient_Label'] = patient_info['label']
+                        feats['Hospital'] = hospital
+                        feats['Modality'] = modality
+                        modality_results.append(feats)
 
-    if results:
-        df = pd.DataFrame(results)
-        df.fillna(0, inplace=True)
-        output_path = '/home/wwt/data/outputs/habitat/habitat_features.csv'
-        df.to_csv(output_path, index=False)
-        LOGGER.info(f"完成！特征已保存至 {output_path}")
-    else:
-        LOGGER.warning("结果为空。")
+            # --- 每个模态处理完后立即保存 ---
+            if modality_results:
+                df = pd.DataFrame(modality_results)
+                df.fillna(0, inplace=True)
+                
+                output_filename = f"{hospital}_{modality}.csv"
+                output_path = output_dir / output_filename
+                
+                df.to_csv(output_path, index=False)
+                LOGGER.info(f"处理完成, 特征已保存至: {output_path}")
+            else:
+                LOGGER.warning(f"医院 [{hospital}], 模态 [{modality}] 未产生任何结果。")
 
-if __name__ == '__main__':
+    LOGGER.info("所有医院及模态均已处理完毕！")
+
+if __name__ == "__main__":
     main()

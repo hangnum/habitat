@@ -1,0 +1,8 @@
+# Python
+__pycache__/
+*.pyc
+*.nrrd
+*.nii
+*.nii.gz
+*.h5
+*.hdf5
