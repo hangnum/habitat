@@ -16,7 +16,12 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import RobustScaler
 from sklearn.impute import SimpleImputer
 
-from .utils import evaluate_model, save_model_coefficients
+try:
+    # 尝试相对导入（作为包的一部分运行）
+    from .utils import evaluate_model, save_model_coefficients
+except ImportError:
+    # 直接运行时使用绝对导入
+    from utils import evaluate_model, save_model_coefficients
 
 LOGGER = logging.getLogger(__name__)
 

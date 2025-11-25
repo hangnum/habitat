@@ -12,16 +12,30 @@ from typing import Optional, Sequence
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 
-from .data_processing import (
-    load_feature_tables,
-    mean_pool_by_patient,
-    filter_modalities,
-    drop_incomplete_modalities,
-    merge_modalities,
-    split_cohorts,
-)
-from .model_training import train_and_tune_model
-from .utils import setup_logging, set_random_seed, save_model_coefficients
+try:
+    # 尝试相对导入（作为包的一部分运行）
+    from .data_processing import (
+        load_feature_tables,
+        mean_pool_by_patient,
+        filter_modalities,
+        drop_incomplete_modalities,
+        merge_modalities,
+        split_cohorts,
+    )
+    from .model_training import train_and_tune_model
+    from .utils import setup_logging, set_random_seed, save_model_coefficients
+except ImportError:
+    # 直接运行时使用绝对导入
+    from data_processing import (
+        load_feature_tables,
+        mean_pool_by_patient,
+        filter_modalities,
+        drop_incomplete_modalities,
+        merge_modalities,
+        split_cohorts,
+    )
+    from model_training import train_and_tune_model
+    from utils import setup_logging, set_random_seed, save_model_coefficients
 
 
 def build_parser() -> ArgumentParser:
