@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import warnings
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -14,6 +14,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 try:
     # 尝试相对导入（作为包的一部分运行）
+    from .config import AppConfig, DEFAULT_CONFIG_PATH, load_app_config
     from .data_processing import (
         load_feature_tables,
         mean_pool_by_patient,
@@ -26,6 +27,7 @@ try:
     from .utils import setup_logging, set_random_seed, save_model_coefficients
 except ImportError:
     # 直接运行时使用绝对导入
+    from config import AppConfig, DEFAULT_CONFIG_PATH, load_app_config
     from data_processing import (
         load_feature_tables,
         mean_pool_by_patient,
@@ -38,49 +40,55 @@ except ImportError:
     from utils import setup_logging, set_random_seed, save_model_coefficients
 
 
-def build_parser() -> ArgumentParser:
+def build_parser(app_config: AppConfig, config_path: Path) -> ArgumentParser:
     """构建命令行参数。"""
     parser = ArgumentParser(description="医学影像特征聚合与 Robust LR 训练（模块化版本）")
     parser.add_argument(
+        "--config",
+        type=Path,
+        default=config_path,
+        help=f"配置文件路径 (JSON)，默认 {config_path}",
+    )
+    parser.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("/home/wwt/data/outputs/habitat"),
+        default=app_config.training.input_dir,
         help="提取特征 CSV 所在目录。",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("./feature"),
+        default=app_config.training.output_dir,
         help="患者级特征与模型输出目录。",
     )
     parser.add_argument(
         "--internal-hospital",
         type=str,
-        default="JM",
+        default=app_config.training.internal_hospital,
         help="划分训练+内验的医院名，其他医院作为外验。",
     )
     parser.add_argument(
         "--val-size",
         type=float,
-        default=0.2,
+        default=app_config.training.val_size,
         help="内验证集占比（仅作用于 internal hospital）。",
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=app_config.training.seed,
         help="随机种子，用于数据划分和模型训练。",
     )
     parser.add_argument(
         "--modalities",
         nargs="+",
-        default=["A", "P"],
+        default=app_config.training.modalities,
         help="仅对这些模态进行横向拼接。",
     )
     parser.add_argument(
         "--log-level",
         type=str,
-        default="INFO",
+        default=app_config.training.log_level,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="日志级别。",
     )
@@ -92,9 +100,20 @@ def build_parser() -> ArgumentParser:
     return parser
 
 
+def parse_args(argv: Optional[Sequence[str]] = None) -> Namespace:
+    """解析命令行参数，支持先行读取配置文件。"""
+    pre_parser = ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    pre_args, _ = pre_parser.parse_known_args(argv)
+
+    app_config = load_app_config(pre_args.config)
+    parser = build_parser(app_config, pre_args.config)
+    return parser.parse_args(argv)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> None:
     """主程序入口。"""
-    args = build_parser().parse_args(argv)
+    args = parse_args(argv)
 
     # 设置日志和随机种子
     setup_logging(args.log_level)

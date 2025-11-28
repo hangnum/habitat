@@ -6,3 +6,18 @@ __pycache__/
 *.nii.gz
 *.h5
 *.hdf5
+
+# 输出目录和结果
+outputs/
+feature/
+results/
+logs/
+*.csv
+*.json
+metrics.json
+coefficients.csv
+
+# 数据目录（医学影像数据）
+data/
+medical_data/
+images/

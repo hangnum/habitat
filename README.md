@@ -12,19 +12,20 @@
 ## 使用
 
 1. 安装依赖（确保本地环境已安装 SimpleITK、scikit-learn、pandas、numpy 等）。
-2. 运行命令：
+2. 根据本地路径修改 `config/defaults.json` 中的目录与参数（可复制为自己的文件，通过 `--config` 指定）。
+3. 运行命令：
 
 ```bash
-python main.py \
-  --data-dir /home/wwt/data/raw/liver/Grade \
-  --output-dir /home/wwt/data/outputs/habitat \
-  --clusters 3 \
-  --bin-width 25 \
-  --min-roi-pixels 10
+# 使用配置文件中的默认值
+python main.py --config config/defaults.json
+
+# 如需临时覆盖配置，可直接传参
+python main.py --config config/defaults.json --data-dir /path/to/images --output-dir ./outputs/habitat
 ```
 
 常用参数：
 
+- `--config`：JSON 配置文件，默认 `config/defaults.json`。
 - `--data-dir`：输入数据根目录，期望结构为 `gradeX/<patient>/<modality>/*.png`。
 - `--output-dir`：结果 CSV 输出目录。
 - `--clusters`：生境 K-Means 簇数。
@@ -32,9 +33,14 @@ python main.py \
 - `--min-roi-pixels`：ROI 最小像素数阈值，低于阈值会跳过。
 - `--quiet`：静默模式，仅输出错误日志。
 
+特征聚合与模型训练同样支持配置文件：
+
+```bash
+python -m habitat_pipeline.training --config config/defaults.json
+```
+
 ## 设计要点
 
 - **模块化**：配置、日志、数据组织、特征提取与调度分层，便于扩展与单测。
 - **稳健性**：影像统一强制 `(1.0, 1.0)` 间距；ROI 像素阈值防止聚类异常；PyRadiomics 日志静音避免刷屏。
 - **依赖精简**：移除 PyRadiomics 的示例、测试、notebook 与实验脚本，仅保留运行所需源码与元数据。
-
